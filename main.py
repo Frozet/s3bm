@@ -2,8 +2,11 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Query, UploadFile, HTTPException
 import aioftp
+from redis import asyncio as aioredis
 from dotenv import load_dotenv
+from typing import List
 import os
+import json
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
@@ -22,6 +25,15 @@ FTP_PORT = int(os.getenv("FTP_PORT"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD")
 FTP_BUCKET = os.getenv("FTP_BUCKET")
+
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT"))
+REDIS_DB = int(os.getenv("REDIS_DB"))
+REDIS_KEY = os.getenv("REDIS_KEY")
+REDIS_TTL = int(os.getenv("REDIS_TTL"))
+
+# Инициализация Redis
+redis_client = aioredis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}")
 
 # Инициализация клиента S3
 s3_client = boto3.client(
@@ -63,6 +75,7 @@ def upload_to_s3(file: UploadFile, bucket: str, key: str):
         region_name=S3_REGION_NAME,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
+        
     )
     try:
         s3_client.upload_fileobj(file.file, bucket, key)
@@ -95,9 +108,19 @@ async def upload_file(
 @app.get("/files/")
 async def list_files():
     try:
+        # Проверяем кэш Redis
+        cached_files = await redis_client.get(REDIS_KEY)
+        if cached_files:
+            # Если данные есть в кэше, возвращаем их
+            files = json.loads(cached_files)
+            return {"files": files, "source": "cache"}
+        
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME)
         files = [obj["Key"] for obj in response.get("Contents", [])]
-        return {"files": files}
+        # Сохраняем список файлов в Redis
+        await redis_client.set(REDIS_KEY, json.dumps(files), ex=REDIS_TTL)
+
+        return {"files": files, "source": "bucket"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -122,3 +145,12 @@ async def delete_file(filename: str):
         return {"message": f"File '{filename}' deleted successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# Сброс кэша вручную
+@app.delete("/cache/")
+async def clear_cache():
+    try:
+        await redis_client.delete(REDIS_KEY)
+        return {"message": "Cache cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
